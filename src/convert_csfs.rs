@@ -3,21 +3,19 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
+use parquet::file::reader::{FileReader, SerializedFileReader};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::Arc;
 
-// Python bindings module
-#[cfg(feature = "extension-module")]
-pub mod python_bindings;
 
 pub fn convert_csf_text_to_parquet(
     csfs_path: &Path,
     output_path: &Path,
     max_line_len: usize,
     chunk_size: usize,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("开始转换，最大行长度: {}", max_line_len);
     println!("输入文件: {:?}", csfs_path);
     println!("输出文件: {:?}", output_path);
@@ -170,108 +168,33 @@ pub fn convert_csf_text_to_parquet(
     Ok(())
 }
 
-// 读取函数（可选）
-pub fn read_csf_from_parquet(
-    parquet_path: &Path,
-    limit: Option<usize>,
-) -> Result<Vec<(String, String, String)>, Box<dyn std::error::Error>> {
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    
-    println!("读取 Parquet 文件: {:?}", parquet_path);
-    let file = File::open(parquet_path)?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)?;
-    let mut reader = builder.build()?;
-    
-    let mut result = Vec::new();
-    let mut total_read = 0;
-    
-    while let Some(batch) = reader.next() {
-        let batch = batch?;
-        
-        // 转换为具体的数组类型
-        let line1_array = batch.column(0).as_any().downcast_ref::<arrow::array::StringArray>()
-            .ok_or("无法转换 column 0 为 StringArray")?;
-        let line2_array = batch.column(1).as_any().downcast_ref::<arrow::array::StringArray>()
-            .ok_or("无法转换 column 1 为 StringArray")?;
-        let line3_array = batch.column(2).as_any().downcast_ref::<arrow::array::StringArray>()
-            .ok_or("无法转换 column 2 为 StringArray")?;
-        
-        for i in 0..batch.num_rows() {
-            if let Some(limit) = limit {
-                if total_read >= limit {
-                    break;
-                }
-            }
-            
-            result.push((
-                line1_array.value(i).to_string(),
-                line2_array.value(i).to_string(),
-                line3_array.value(i).to_string(),
-            ));
-            total_read += 1;
-        }
-        
-        if limit.is_some() && total_read >= limit.unwrap() {
-            break;
-        }
-    }
-    
-    println!("成功读取 {} 个 CSF", result.len());
-    Ok(result)
-}
+/// 获取 Parquet 文件基本信息（仅元数据）
+pub fn get_parquet_metadata(parquet_path: &Path) -> Result<pyo3::Py<pyo3::PyAny>, Box<dyn std::error::Error + Send + Sync>> {
+    use pyo3::{Python, types::{PyDict, PyDictMethods}};
 
-// 获取文件信息
-pub fn get_parquet_info(parquet_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    use parquet::file::reader::{FileReader, SerializedFileReader};
-    
+    // 获取文件大小
+    let file_metadata = std::fs::metadata(parquet_path)?;
+    let file_size = file_metadata.len();
+
+    // 打开 Parquet 文件
     let file = File::open(parquet_path)?;
     let reader = SerializedFileReader::new(file)?;
-    
     let metadata = reader.metadata();
-    let num_rows = metadata.file_metadata().num_rows();
-    let num_row_groups = metadata.num_row_groups();
-    
-    println!("Parquet 文件信息:");
-    println!("  文件路径: {:?}", parquet_path);
-    println!("  总行数: {}", num_rows);
-    println!("  Row Groups: {}", num_row_groups);
-    println!("  CSF 数量: {}", num_rows);
-    
-    // 显示 schema
-    let schema = metadata.file_metadata().schema();
-    println!("  Schema:");
-    for field in schema.get_fields() {
-        println!("    - {}: {:?}", field.name(), field.get_physical_type());
-    }
-    
-    Ok(())
-}
 
-// 使用示例
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use std::path::PathBuf;
-    
-    // 转换文件
-    convert_csf_text_to_parquet(
-        &PathBuf::from("input.csfs"),
-        &PathBuf::from("output.parquet"),
-        256,
-        30000,
-    )?;
-    
-    // 获取文件信息
-    get_parquet_info(&PathBuf::from("output.parquet"))?;
-    
-    // 读取前10个CSF验证
-    let csfs = read_csf_from_parquet(&PathBuf::from("output.parquet"), Some(10))?;
-    println!("\n前10个CSF示例:");
-    for (i, (line1, line2, line3)) in csfs.iter().enumerate() {
-        println!("CSF {}:", i + 1);
-        println!("  Line1: {}...", if line1.len() > 50 { &line1[..50] } else { line1 });
-        println!("  Line2: {}...", if line2.len() > 50 { &line2[..50] } else { line2 });
-        println!("  Line3: {}...", if line3.len() > 50 { &line3[..50] } else { line3 });
-        println!();
-    }
-    
-    Ok(())
+    // 获取行数和列数
+    let num_rows = metadata.file_metadata().num_rows();
+    let schema = metadata.file_metadata().schema();
+    let num_columns = schema.get_fields().len();
+
+    // 创建 Python 字典并返回
+    Python::attach(|py| {
+        let dict = PyDict::new(py);
+        dict.set_item("file_path", parquet_path.to_string_lossy().as_ref())?;
+        dict.set_item("file_size", file_size)?;
+        dict.set_item("num_rows", num_rows)?;
+        dict.set_item("num_columns", num_columns)?;
+        dict.set_item("compression", metadata.file_metadata().created_by().unwrap_or("Unknown"))?;
+
+        Ok(dict.into())
+    })
 }

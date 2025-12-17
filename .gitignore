@@ -1,27 +1,25 @@
 # pixi environments
-.pixi/*
+.pixi/
 !.pixi/config.toml
-
-
+pixi.lock
 # Added by cargo
 
-/target
-**/*.rs.bk
+# 编译产物
+/target/
+**/*.so
+**/*.dll
+**/*.dylib
+**/*.pyc
 __pycache__/
-*.py[cod]
 *.egg-info/
-/dist/
-/build/
-/env/
-/env3*/
-.pytest_cache/
-.mypy_cache/
-/sandbox/
-/htmlcov/
-/.idea/
-/.vscode/
-/python/rtoml/*.so
-.coverage
-.auto-format
-/toml-test/
-/.benchmarks/
+
+# Python 虚拟环境
+.venv/
+uv.lock
+.env/
+.python-version
+
+# IDE 文件
+.vscode/
+.idea/
+*.swp
