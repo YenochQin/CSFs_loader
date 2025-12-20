@@ -428,7 +428,7 @@ pub fn convert_csfs_to_parquet(
         match lines_iter.next() {
             Some(Ok(line)) => {
                 headers.push(line);
-                println!("  Header {}: {} 字符", i + 1, headers.last().unwrap().len());
+                // println!("  Header {}: {} 字符", i + 1, headers.last().unwrap().len());
             }
             Some(Err(e)) => return Err(e.into()),
             None => {
