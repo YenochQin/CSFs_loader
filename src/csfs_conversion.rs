@@ -88,7 +88,7 @@ pub fn convert_csfs_to_parquet_parallel(
         match lines_iter.next() {
             Some(Ok(line)) => {
                 headers.push(line);
-                println!("  Header {}: {} 字符", i + 1, headers.last().unwrap().len());
+                // println!("  Header {}: {} 字符", i + 1, headers.last().unwrap().len());
             }
             Some(Err(e)) => return Err(e.into()),
             None => {
@@ -253,7 +253,7 @@ fn file_reader_thread(
     let mut chunk_lines = Vec::with_capacity(chunk_size);
     let mut global_csf_count = 0;
 
-    println!("开始并行读取 CSF 数据...");
+    println!("开始读取 CSF 数据...");
 
     for line_result in lines_iter {
         match line_result {
@@ -286,7 +286,7 @@ fn file_reader_thread(
                         chunk_id += 1;
 
                         if chunk_id % 100 == 0 {
-                            println!("已发送 {} 个数据块", chunk_id);
+                            // println!("已发送 {} 个数据块", chunk_id);
                         }
                     }
                 }
@@ -309,7 +309,7 @@ fn file_reader_thread(
         }
     }
 
-    println!("文件读取完成，共发送 {} 个数据块", chunk_id + 1);
+    // println!("文件读取完成，共发送 {} 个数据块", chunk_id + 1);
     Ok(())
 }
 
