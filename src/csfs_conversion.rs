@@ -19,7 +19,7 @@ struct HeaderInfo {
     header_lines: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ConversionStats {
     pub csf_count: usize,
     pub total_lines: usize,
@@ -34,7 +34,7 @@ struct HeaderData {
 
 #[derive(Debug, Clone)]
 struct ProcessedChunk {
-    chunk_id: usize,
+    start_csf_index: usize,
     line1_values: Vec<String>,
     line2_values: Vec<String>,
     line3_values: Vec<String>,
@@ -45,7 +45,9 @@ struct ProcessedChunk {
 
 #[derive(Debug)]
 struct WorkChunk {
+    #[allow(dead_code)]
     chunk_id: usize,
+    start_csf_index: usize,
     lines: Vec<String>,
 }
 
@@ -109,24 +111,24 @@ pub fn convert_csfs_to_parquet_parallel(
         let max_line_len = max_line_len;
 
         let handle = thread::spawn(move || {
-            worker_process(work_id, work_receiver, result_sender, max_line_len);
+            worker_process(worker_id, work_receiver, result_sender, max_line_len);
         });
 
         worker_handles.push(handle);
     }
 
-    // Drop sender copies for worker threads
-    drop(work_sender);
-    drop(result_sender);
-
     // --- 3. 启动文件读取线程 ---
     let reader_thread = thread::spawn({
-        let work_sender = work_sender;
+        let work_sender = work_sender.clone();
         let csfs_path = csfs_path.to_owned();
         move || {
             file_reader_thread(csfs_path, chunk_size, work_sender)
         }
     });
+
+    // Drop sender copies for worker threads after starting reader thread
+    drop(work_sender);
+    drop(result_sender);
 
     // --- 4. 启动写入线程 ---
     let writer_thread = thread::spawn({
@@ -174,7 +176,7 @@ pub fn convert_csfs_to_parquet_parallel(
 
 // 工作线程函数
 fn worker_process(
-    worker_id: usize,
+    _worker_id: usize,
     work_receiver: Receiver<WorkChunk>,
     result_sender: Sender<ProcessedChunk>,
     max_line_len: usize,
@@ -187,7 +189,7 @@ fn worker_process(
         let mut truncated_count = 0;
 
         // 处理行，确保是 3 的倍数
-        let full_csfs = work_chunk.lines.len() / 3;
+        let _full_csfs = work_chunk.lines.len() / 3;
         for chunk in work_chunk.lines.chunks(3) {
             if chunk.len() == 3 {
                 // 处理每一行
@@ -217,7 +219,7 @@ fn worker_process(
         }
 
         let processed_chunk = ProcessedChunk {
-            chunk_id: work_chunk.chunk_id,
+            start_csf_index: work_chunk.start_csf_index,
             line1_values,
             line2_values,
             line3_values,
@@ -249,6 +251,7 @@ fn file_reader_thread(
 
     let mut chunk_id = 0;
     let mut chunk_lines = Vec::with_capacity(chunk_size);
+    let mut global_csf_count = 0;
 
     println!("开始并行读取 CSF 数据...");
 
@@ -258,18 +261,33 @@ fn file_reader_thread(
                 chunk_lines.push(line);
 
                 if chunk_lines.len() >= chunk_size {
-                    // 发送当前块
-                    let work_chunk = WorkChunk {
-                        chunk_id,
-                        lines: chunk_lines.clone(),
-                    };
+                    // 确保发送的块包含完整的 CSF（3 的倍数行）
+                    let num_full_csfs = chunk_lines.len() / 3;
+                    let lines_to_send = num_full_csfs * 3;
 
-                    work_sender.send(work_chunk)?;
-                    chunk_lines.clear();
-                    chunk_id += 1;
+                    if lines_to_send > 0 {
+                        let start_csf_index = global_csf_count;
 
-                    if chunk_id % 100 == 0 {
-                        println!("已发送 {} 个数据块", chunk_id);
+                        // 发送完整 CSF 的行
+                        let work_chunk = WorkChunk {
+                            chunk_id,
+                            start_csf_index,
+                            lines: chunk_lines[..lines_to_send].to_vec(),
+                        };
+
+                        work_sender.send(work_chunk)?;
+
+                        // 更新全局 CSF 计数
+                        global_csf_count += num_full_csfs;
+
+                        // 保留剩余的行到下一块
+                        let remaining_lines = chunk_lines[lines_to_send..].to_vec();
+                        chunk_lines = remaining_lines;
+                        chunk_id += 1;
+
+                        if chunk_id % 100 == 0 {
+                            println!("已发送 {} 个数据块", chunk_id);
+                        }
                     }
                 }
             }
@@ -277,13 +295,18 @@ fn file_reader_thread(
         }
     }
 
-    // 发送剩余的行
+    // 发送剩余的行（确保是 3 的倍数）
     if !chunk_lines.is_empty() {
-        let work_chunk = WorkChunk {
-            chunk_id,
-            lines: chunk_lines,
-        };
-        work_sender.send(work_chunk)?;
+        let num_full_csfs = chunk_lines.len() / 3;
+        if num_full_csfs > 0 {
+            let lines_to_send = num_full_csfs * 3;
+            let work_chunk = WorkChunk {
+                chunk_id,
+                start_csf_index: global_csf_count,
+                lines: chunk_lines[..lines_to_send].to_vec(),
+            };
+            work_sender.send(work_chunk)?;
+        }
     }
 
     println!("文件读取完成，共发送 {} 个数据块", chunk_id + 1);
@@ -313,54 +336,62 @@ fn writer_thread(
 
     let mut writer = ArrowWriter::try_new(output_file, schema.clone(), Some(props))?;
 
-    // 使用有序写入缓冲区
-    let mut write_buffer = std::collections::HashMap::new();
-    let mut next_chunk_id = 0;
+    // 使用基于 CSF 索引的有序写入缓冲区
+    let mut write_buffer = std::collections::BTreeMap::new();
+    let mut next_csf_index = 0;
 
     println!("开始有序写入 Parquet 文件...");
 
     for processed_chunk in result_receiver {
-        write_buffer.insert(processed_chunk.chunk_id, processed_chunk);
+        write_buffer.insert(processed_chunk.start_csf_index, processed_chunk);
 
-        // 按顺序写入连续的块
-        while let Some(chunk) = write_buffer.remove(&next_chunk_id) {
-            // 创建 Arrow 数组
-            let mut line1_builder = StringBuilder::with_capacity(chunk.csf_count, chunk.csf_count * 256);
-            let mut line2_builder = StringBuilder::with_capacity(chunk.csf_count, chunk.csf_count * 256);
-            let mut line3_builder = StringBuilder::with_capacity(chunk.csf_count, chunk.csf_count * 256);
+        // 按 CSF 索引顺序写入连续的块
+        while let Some((start_index, chunk)) = write_buffer.iter().next().map(|(k, v)| (*k, v.clone())) {
+            if start_index == next_csf_index {
+                // 这是下一个期望的块
+                write_buffer.remove(&start_index);
 
-            for i in 0..chunk.csf_count {
-                line1_builder.append_value(&chunk.line1_values[i]);
-                line2_builder.append_value(&chunk.line2_values[i]);
-                line3_builder.append_value(&chunk.line3_values[i]);
-            }
+                // 创建 Arrow 数组
+                let mut line1_builder = StringBuilder::with_capacity(chunk.csf_count, chunk.csf_count * 256);
+                let mut line2_builder = StringBuilder::with_capacity(chunk.csf_count, chunk.csf_count * 256);
+                let mut line3_builder = StringBuilder::with_capacity(chunk.csf_count, chunk.csf_count * 256);
 
-            // 构建 RecordBatch
-            let batch = RecordBatch::try_new(
-                schema.clone(),
-                vec![
-                    Arc::new(line1_builder.finish()),
-                    Arc::new(line2_builder.finish()),
-                    Arc::new(line3_builder.finish()),
-                ],
-            )?;
+                for i in 0..chunk.csf_count {
+                    line1_builder.append_value(&chunk.line1_values[i]);
+                    line2_builder.append_value(&chunk.line2_values[i]);
+                    line3_builder.append_value(&chunk.line3_values[i]);
+                }
 
-            // 写入 Parquet
-            writer.write(&batch)?;
+                // 构建 RecordBatch
+                let batch = RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(line1_builder.finish()),
+                        Arc::new(line2_builder.finish()),
+                        Arc::new(line3_builder.finish()),
+                    ],
+                )?;
 
-            // 更新统计信息
-            {
-                let mut stats = total_stats.lock().unwrap();
-                stats.csf_count += chunk.csf_count;
-                stats.total_lines += chunk.line_count;
-                stats.truncated_count += chunk.truncated_count;
-            }
+                // 写入 Parquet
+                writer.write(&batch)?;
 
-            next_chunk_id += 1;
+                // 更新统计信息
+                {
+                    let mut stats = total_stats.lock().unwrap();
+                    stats.csf_count += chunk.csf_count;
+                    stats.total_lines += chunk.line_count;
+                    stats.truncated_count += chunk.truncated_count;
+                }
 
-            if next_chunk_id % 50 == 0 {
-                let stats = total_stats.lock().unwrap();
-                println!("已写入 {} 个数据块, {} 个 CSF", next_chunk_id, stats.csf_count);
+                next_csf_index += chunk.csf_count;
+
+                if next_csf_index % 50000 == 0 {
+                    let stats = total_stats.lock().unwrap();
+                    println!("已写入 {} 个 CSF", stats.csf_count);
+                }
+            } else {
+                // 下一个块还没到达，等待
+                break;
             }
         }
     }
@@ -370,7 +401,7 @@ fn writer_thread(
 
     // 返回最终统计信息
     let stats = total_stats.lock().unwrap().clone();
-    println!("Parquet 写入完成，共写入 {} 个数据块", next_chunk_id);
+    println!("Parquet 写入完成，共处理 {} 个 CSF", next_csf_index);
 
     Ok(stats)
 }
