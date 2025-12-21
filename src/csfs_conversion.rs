@@ -84,7 +84,7 @@ pub fn convert_csfs_to_parquet_parallel(
 
     let mut headers = Vec::with_capacity(5);
     println!("读取 Header...");
-    for i in 0..5 {
+    for _i in 0..5 {
         match lines_iter.next() {
             Some(Ok(line)) => {
                 headers.push(line);
@@ -424,7 +424,7 @@ pub fn convert_csfs_to_parquet(
     // --- 1. 处理 Header (5行) ---
     let mut headers = Vec::with_capacity(5);
     println!("读取 Header...");
-    for i in 0..5 {
+    for _i in 0..5 {
         match lines_iter.next() {
             Some(Ok(line)) => {
                 headers.push(line);
