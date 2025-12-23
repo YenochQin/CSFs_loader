@@ -51,9 +51,10 @@ required-environments = [
     "sys_platform == 'linux' and platform_machine == 'x86_64'",
     "sys_platform == 'win32' and (platform_machine == 'AMD64' or platform_machine == 'x86_64')",
 ]
+
 [tool.pixi.workspace]
-channels = ["conda-forge"]
-platforms = ["win-64"]
+channels = ["https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge"]
+platforms = ["win-64", "linux-64"]
 
 [tool.pixi.pypi-dependencies]
 csfs_loader = { path = ".", editable = true }
