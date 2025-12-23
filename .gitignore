@@ -23,3 +23,6 @@ uv.lock
 .vscode/
 .idea/
 *.swp
+# pixi environments
+.pixi/*
+!.pixi/config.toml
