@@ -114,12 +114,25 @@ class DescriptorGenerationStats(TypedDict):
     error: NotRequired[str]
 
 
+class ParallelDescriptorGenerationStats(DescriptorGenerationStats):
+    """Statistics returned from parallel descriptor generation operations."""
+    pass  # Inherits all fields from DescriptorGenerationStats
+
+
 def py_generate_descriptors_from_parquet(
     input_parquet: str,
     output_parquet: str,
     peel_subshells: Optional[list[str]] = None,
     header_path: Optional[str] = None,
 ) -> DescriptorGenerationStats: ...
+
+def py_generate_descriptors_from_parquet_parallel(
+    input_parquet: str,
+    output_parquet: str,
+    peel_subshells: list[str],
+    num_workers: Optional[int] = None,
+    rows_per_task: Optional[int] = None,
+) -> ParallelDescriptorGenerationStats: ...
 
 def py_read_peel_subshells(header_path: str) -> list[str]: ...
 

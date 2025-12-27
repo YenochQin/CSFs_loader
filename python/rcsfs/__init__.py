@@ -89,6 +89,7 @@ try:
 
         # Batch descriptor generation
         py_generate_descriptors_from_parquet as _generate_descriptors_from_parquet,
+        py_generate_descriptors_from_parquet_parallel as _generate_descriptors_from_parquet_parallel,
         py_read_peel_subshells as _read_peel_subshells,
     )
 except ImportError:
@@ -107,6 +108,7 @@ except ImportError:
 
         # Batch descriptor generation
         py_generate_descriptors_from_parquet as _generate_descriptors_from_parquet,
+        py_generate_descriptors_from_parquet_parallel as _generate_descriptors_from_parquet_parallel,
         py_read_peel_subshells as _read_peel_subshells,
     )
 
@@ -304,6 +306,11 @@ class DescriptorGenerationStats(TypedDict):
     error: NotRequired[str]
 
 
+class ParallelDescriptorGenerationStats(DescriptorGenerationStats):
+    """Statistics returned from parallel descriptor generation operations."""
+    pass  # Inherits all fields from DescriptorGenerationStats
+
+
 def generate_descriptors_from_parquet(
     input_parquet: Union[str, Path],
     output_parquet: Union[str, Path],
@@ -371,6 +378,84 @@ def generate_descriptors_from_parquet(
         output_parquet=str(output_parquet),
         peel_subshells=peel_subshells,
         header_path=str(header_path) if header_path else None,
+    )
+
+
+def generate_descriptors_from_parquet_parallel(
+    input_parquet: Union[str, Path],
+    output_parquet: Union[str, Path],
+    peel_subshells: list[str],
+    num_workers: Optional[int] = None,
+    rows_per_task: Optional[int] = None,
+) -> ParallelDescriptorGenerationStats:
+    """
+    Generate CSF descriptors from a parquet file using parallel processing.
+
+    This function is optimized for large-scale descriptor generation (tens of millions
+    to billions of CSFs). It combines:
+    1. Streaming batch reading from parquet (memory efficient)
+    2. Multi-threaded parallel processing within each batch (CPU efficient)
+
+    Output Schema:
+        The output parquet file will have descriptor_size columns (col_0, col_1, ..., col_N),
+        where each row represents a CSF descriptor with each element in its own column.
+        This format is convenient for use with polars and other dataframe libraries.
+
+    Args:
+        input_parquet: Path to input parquet file (must have line1, line2, line3, idx columns)
+        output_parquet: Path to output parquet file for descriptors
+        peel_subshells: List of subshell names (e.g., ['5s', '4d-', '4d', '5p-', '5p', '6s'])
+        num_workers: Number of worker threads (default: CPU core count)
+        rows_per_task: Number of rows per parallel task (default: 1000)
+
+    Returns:
+        Dictionary containing generation statistics:
+        - success: Whether generation succeeded
+        - input_file: Input parquet file path
+        - output_file: Output parquet file path
+        - csf_count: Number of CSFs processed
+        - descriptor_count: Number of descriptors generated
+        - orbital_count: Number of orbitals
+        - descriptor_size: Size of each descriptor (3 * orbital_count)
+
+    Examples:
+        >>> # Basic usage with auto-detected peel_subshells
+        >>> from rcsfs import read_peel_subshells, generate_descriptors_from_parquet_parallel
+        >>>
+        >>> peel_subshells = read_peel_subshells("data_header.toml")
+        >>> stats = generate_descriptors_from_parquet_parallel(
+        ...     "csfs_data.parquet",
+        ...     "descriptors.parquet",
+        ...     peel_subshells=peel_subshells
+        ... )
+
+        >>> # Read with polars
+        >>> import polars as pl
+        >>> df = pl.read_parquet("descriptors.parquet")
+        >>> descriptors = df.to_numpy()  # Shape: (n_csfs, descriptor_size)
+
+        >>> # With custom settings for large files
+        >>> stats = generate_descriptors_from_parquet_parallel(
+        ...     "csfs_data.parquet",
+        ...     "descriptors.parquet",
+        ...     peel_subshells=['5s', '4d-', '4d', '5p-', '5p', '6s'],
+        ...     num_workers=8,
+        ...     rows_per_task=5000
+        ... )
+
+    Performance Considerations:
+        - For small files (<1M CSFs): use generate_descriptors_from_parquet() instead
+        - For medium files (1-10M CSFs): num_workers=4-8, rows_per_task=1000-2000
+        - For large files (>10M CSFs): num_workers=8+, rows_per_task=5000-10000
+        - More workers = higher CPU usage, faster processing
+        - Larger rows_per_task = less overhead, but may reduce parallelism
+    """
+    return _generate_descriptors_from_parquet_parallel(
+        input_parquet=str(input_parquet),
+        output_parquet=str(output_parquet),
+        peel_subshells=peel_subshells,
+        num_workers=num_workers,
+        rows_per_task=rows_per_task,
     )
 
 
@@ -513,6 +598,7 @@ __all__ = [
 
     # Batch descriptor generation
     "generate_descriptors_from_parquet",
+    "generate_descriptors_from_parquet_parallel",
     "read_peel_subshells",
 
     # Type definitions
@@ -520,6 +606,7 @@ __all__ = [
     "ParallelConversionStats",
     "HeaderInfo",
     "DescriptorGenerationStats",
+    "ParallelDescriptorGenerationStats",
 ]
 
 

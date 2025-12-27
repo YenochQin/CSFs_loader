@@ -7,6 +7,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::fs::read_to_string;
+use std::thread;
+use std::sync::{Arc, Mutex};
+use crossbeam_channel::{bounded, Sender, Receiver};
 
 /// Parquet reading support
 pub mod parquet_batch {
@@ -290,6 +293,415 @@ pub mod parquet_batch {
             descriptor_count,
             orbital_count,
             descriptor_size,
+        })
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////
+    // Parallel Descriptor Generation (Streaming + Multi-threaded per batch)
+    ////////////////////////////////////////////////////////////////////////////////
+
+    /// Work item for descriptor generation
+    #[derive(Debug)]
+    struct DescriptorWorkItem {
+        batch_idx: usize,
+        start_row_in_batch: usize,
+        rows: Vec<(u64, String, String, String)>, // (idx, line1, line2, line3)
+    }
+
+    /// Processed descriptor result
+    #[derive(Debug)]
+    struct DescriptorResult {
+        batch_idx: usize,
+        start_row_in_batch: usize,
+        descriptors: Vec<Vec<f32>>,
+    }
+
+    /// Generate descriptors from parquet with parallel processing
+    ///
+    /// This function combines:
+    /// 1. Streaming batch reading from parquet (memory efficient)
+    /// 2. Multi-threaded parallel processing within each batch (CPU efficient)
+    ///
+    /// # Arguments
+    /// * `input_parquet` - Path to input parquet file
+    /// * `output_parquet` - Path to output parquet file
+    /// * `peel_subshells` - List of subshell names
+    /// * `num_workers` - Number of worker threads (default: CPU core count)
+    /// * `rows_per_task` - Number of rows per parallel task (default: 1000)
+    pub fn generate_descriptors_from_parquet_parallel(
+        input_parquet: &Path,
+        output_parquet: &Path,
+        peel_subshells: Vec<String>,
+        num_workers: Option<usize>,
+        rows_per_task: Option<usize>,
+    ) -> Result<BatchDescriptorStats, String> {
+        let num_workers = num_workers.unwrap_or_else(|| num_cpus::get());
+        let rows_per_task = rows_per_task.unwrap_or(1000);
+        let work_queue_size = num_workers * 2;
+        // Use unbounded channel for results to prevent deadlock
+        let (result_sender, result_receiver) = crossbeam_channel::unbounded::<DescriptorResult>();
+
+        let orbital_count = peel_subshells.len();
+        let descriptor_size = 3 * orbital_count;
+
+        eprintln!("启动并行描述符生成:");
+        eprintln!("  工作线程数: {}", num_workers);
+        eprintln!("  每任务行数: {}", rows_per_task);
+        eprintln!("  轨道数: {}", orbital_count);
+        eprintln!("  描述符大小: {}", descriptor_size);
+
+        // Create descriptor generator (shared by all workers)
+        let generator = Arc::new(super::CSFDescriptorGenerator::new(peel_subshells.clone()));
+
+        // Create channel for work distribution (bounded)
+        let (work_sender, work_receiver) = bounded::<DescriptorWorkItem>(work_queue_size);
+
+        // Statistics
+        let total_csfs = Arc::new(Mutex::new(0usize));
+        let descriptor_count = Arc::new(Mutex::new(0usize));
+
+        ////////////////////////////////////////////////////////////////////////////////
+        // Step 1: Start worker threads
+        ////////////////////////////////////////////////////////////////////////////////
+        let mut worker_handles = Vec::new();
+        for worker_id in 0..num_workers {
+            let work_receiver = work_receiver.clone();
+            let result_sender = result_sender.clone();
+            let generator = generator.clone();
+
+            let handle = thread::spawn(move || {
+                descriptor_worker(worker_id, work_receiver, result_sender, generator);
+            });
+
+            worker_handles.push(handle);
+        }
+
+        ////////////////////////////////////////////////////////////////////////////////
+        // Step 2: Start separate reader and writer threads (run concurrently)
+        ////////////////////////////////////////////////////////////////////////////////
+
+        // Reader thread: reads parquet and sends work items
+        let reader_thread = thread::spawn({
+            let input_parquet = input_parquet.to_path_buf();
+            let work_sender = work_sender.clone();
+            let total_csfs = total_csfs.clone();
+
+            move || {
+                reader_thread(input_parquet, work_sender, total_csfs, rows_per_task)
+            }
+        });
+
+        // Writer thread: collects results and writes to parquet
+        let writer_thread = thread::spawn({
+            let output_parquet = output_parquet.to_path_buf();
+            let result_receiver = result_receiver;
+            let descriptor_count = descriptor_count.clone();
+            let descriptor_size = 3 * orbital_count;
+
+            move || {
+                writer_thread(output_parquet, result_receiver, descriptor_count, descriptor_size, rows_per_task)
+            }
+        });
+
+        // Drop sender copies for worker threads
+        drop(work_sender);
+        drop(result_sender);
+
+        ////////////////////////////////////////////////////////////////////////////////
+        // Step 3: Wait for completion
+        ////////////////////////////////////////////////////////////////////////////////
+        let csf_count = reader_thread.join().unwrap()?;
+        let result = writer_thread.join().unwrap()?;
+
+        for handle in worker_handles {
+            handle.join().unwrap();
+        }
+
+        eprintln!("\n并行描述符生成完成！");
+        eprintln!("  总 CSF 数: {}", csf_count);
+        eprintln!("  生成描述符数: {}", result.descriptor_count);
+
+        Ok(BatchDescriptorStats {
+            input_file: input_parquet.to_string_lossy().to_string(),
+            output_file: output_parquet.to_string_lossy().to_string(),
+            csf_count,
+            descriptor_count: result.descriptor_count,
+            orbital_count,
+            descriptor_size,
+        })
+    }
+
+    /// Worker thread for descriptor generation
+    fn descriptor_worker(
+        worker_id: usize,
+        work_receiver: Receiver<DescriptorWorkItem>,
+        result_sender: Sender<DescriptorResult>,
+        generator: Arc<super::CSFDescriptorGenerator>,
+    ) {
+        eprintln!("Worker {} started", worker_id);
+        let mut work_count = 0usize;
+        for work_item in work_receiver {
+            work_count += 1;
+            let mut descriptors = Vec::with_capacity(work_item.rows.len());
+
+            for (idx, line1, line2, line3) in work_item.rows {
+                match generator.parse_csf(&line1, &line2, &line3) {
+                    Ok(descriptor) => {
+                        descriptors.push(descriptor);
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to parse CSF at index {}: {}", idx, e);
+                        // Push zero descriptor on error
+                        descriptors.push(vec![0.0f32; descriptor_size_from_generator(&generator)]);
+                    }
+                }
+            }
+
+            let result = DescriptorResult {
+                batch_idx: work_item.batch_idx,
+                start_row_in_batch: work_item.start_row_in_batch,
+                descriptors,
+            };
+
+            eprintln!("Worker {} sending result for batch_idx={}, start_row={}, size={}", worker_id, result.batch_idx, result.start_row_in_batch, result.descriptors.len());
+            result_sender.send(result).unwrap();
+        }
+        eprintln!("Worker {} finished, processed {} work items", worker_id, work_count);
+    }
+
+    /// Helper to get descriptor size from generator
+    fn descriptor_size_from_generator(generator: &super::CSFDescriptorGenerator) -> usize {
+        3 * generator.orbital_count()
+    }
+
+    /// Writer result with descriptor count
+    #[derive(Debug)]
+    struct WriterResult {
+        pub descriptor_count: usize,
+    }
+
+    /// Reader thread: streams batches from input parquet and sends work items
+    fn reader_thread(
+        input_parquet: PathBuf,
+        work_sender: Sender<DescriptorWorkItem>,
+        total_csfs: Arc<Mutex<usize>>,
+        rows_per_task: usize,
+    ) -> Result<usize, String> {
+        let file = std::fs::File::open(&input_parquet)
+            .map_err(|e| format!("Failed to open input parquet: {}", e))?;
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| format!("Failed to create parquet reader: {}", e))?;
+
+        let schema = builder.schema();
+        eprintln!("Input parquet schema: {}", schema);
+
+        let mut reader = builder.build()
+            .map_err(|e| format!("Failed to build parquet reader: {}", e))?;
+
+        let mut global_batch_idx = 0usize;
+        let mut total_processed = 0usize;
+
+        eprintln!("开始流式处理 parquet 文件...");
+
+        loop {
+            match reader.next() {
+                Some(Ok(batch)) => {
+                    let batch_size = batch.num_rows();
+                    eprintln!("读取批次 {} ({} 行)", global_batch_idx, batch_size);
+
+                    // Get columns by index (parquet schema: idx, line1, line2, line3)
+                    let idx_col = batch.column(0)
+                        .as_any()
+                        .downcast_ref::<UInt64Array>()
+                        .ok_or("idx column is not uint64 type")?;
+
+                    let line1_col = batch.column(1)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or("line1 column is not string type")?;
+
+                    let line2_col = batch.column(2)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or("line2 column is not string type")?;
+
+                    let line3_col = batch.column(3)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or("line3 column is not string type")?;
+
+                    // Extract rows and send work items
+                    let mut start_row = 0;
+                    while start_row < batch_size {
+                        let end_row = (start_row + rows_per_task).min(batch_size);
+
+                        let mut rows = Vec::with_capacity(end_row - start_row);
+                        for i in start_row..end_row {
+                            rows.push((
+                                idx_col.value(i),
+                                line1_col.value(i).to_string(),
+                                line2_col.value(i).to_string(),
+                                line3_col.value(i).to_string(),
+                            ));
+                        }
+
+                        let work_item = DescriptorWorkItem {
+                            batch_idx: global_batch_idx,
+                            start_row_in_batch: start_row,
+                            rows,
+                        };
+
+                        work_sender.send(work_item)
+                            .map_err(|e| format!("Failed to send work item: {}", e))?;
+
+                        start_row = end_row;
+                    }
+
+                    // Update totals
+                    {
+                        let mut count = total_csfs.lock().unwrap();
+                        *count += batch_size;
+                    }
+                    total_processed += batch_size;
+
+                    global_batch_idx += 1;
+                }
+                Some(Err(e)) => {
+                    return Err(format!("Error reading parquet batch: {}", e));
+                }
+                None => break,
+            }
+        }
+
+        eprintln!("读取完成，共 {} 个批次，{} 行", global_batch_idx, total_processed);
+        Ok(total_processed)
+    }
+
+    /// Writer thread: collects results and writes to output parquet in order
+    fn writer_thread(
+        output_parquet: PathBuf,
+        result_receiver: Receiver<DescriptorResult>,
+        descriptor_count: Arc<Mutex<usize>>,
+        descriptor_size: usize,
+        rows_per_task: usize,
+    ) -> Result<WriterResult, String> {
+        use parquet::arrow::ArrowWriter;
+        use arrow::datatypes::{Schema, Field, DataType};
+        use arrow::array::{Float32Array, Array};
+        use std::collections::BTreeMap;
+        use std::sync::Arc;
+
+        ////////////////////////////////////////////////////////////////////////////////
+        // Create output parquet writer
+        ////////////////////////////////////////////////////////////////////////////////
+        let mut fields = Vec::with_capacity(descriptor_size);
+        for i in 0..descriptor_size {
+            fields.push(Field::new(format!("col_{}", i), DataType::Float32, false));
+        }
+        let output_schema = Arc::new(Schema::new(fields));
+
+        let output_file = std::fs::File::create(&output_parquet)
+            .map_err(|e| format!("Failed to create output parquet: {}", e))?;
+
+        let props = parquet::file::properties::WriterProperties::builder()
+            .set_compression(parquet::basic::Compression::ZSTD(parquet::basic::ZstdLevel::default()))
+            .build();
+
+        let mut writer = ArrowWriter::try_new(output_file, output_schema.clone(), Some(props))
+            .map_err(|e| format!("Failed to create arrow writer: {}", e))?;
+
+        ////////////////////////////////////////////////////////////////////////////////
+        // Collect and write results in order
+        ////////////////////////////////////////////////////////////////////////////////
+        eprintln!("开始收集并写入结果...");
+
+        let mut pending_results: BTreeMap<(usize, usize), Vec<Vec<f32>>> = BTreeMap::new();
+        let mut next_write_idx = (0usize, 0usize); // (batch_idx, start_row_in_batch)
+        let mut total_processed = 0usize;
+        let mut total_written = 0usize;
+
+        for result in result_receiver {
+            let key = (result.batch_idx, result.start_row_in_batch);
+            let result_size = result.descriptors.len();
+            pending_results.insert(key, result.descriptors);
+            total_processed += result_size;
+            eprintln!("Writer received result for batch_idx={}, start_row={}, size={}", result.batch_idx, result.start_row_in_batch, result_size);
+
+            // Write consecutive results
+            while let Some(descs) = pending_results.remove(&next_write_idx) {
+                // Convert to Arrow arrays (column-oriented)
+                let column_arrays: Vec<Arc<dyn Array>> = (0..descriptor_size)
+                    .map(|col_idx| {
+                        let values: Vec<f32> = descs
+                            .iter()
+                            .map(|desc| desc[col_idx])
+                            .collect();
+                        Arc::new(Float32Array::from(values)) as Arc<dyn Array>
+                    })
+                    .collect();
+
+                // Create output record batch
+                use arrow::record_batch::RecordBatch;
+                let output_batch = RecordBatch::try_new(
+                    output_schema.clone(),
+                    column_arrays,
+                ).map_err(|e| format!("Failed to create output batch: {}", e))?;
+
+                writer.write(&output_batch)
+                    .map_err(|e| format!("Failed to write batch: {}", e))?;
+
+                // Update descriptor count
+                {
+                    let mut count = descriptor_count.lock().unwrap();
+                    *count += descs.len();
+                }
+                total_written += descs.len();
+
+                // Move to next expected result
+                // Key insight: batch splitting always creates (batch_idx, 0) and (batch_idx, rows_per_task)
+                // We can determine what to expect next by checking current start_row
+                let (curr_batch_idx, curr_start_row) = next_write_idx;
+
+                if curr_start_row == 0 {
+                    // We just wrote (batch_idx, 0)
+                    // If we also have (batch_idx, rows_per_task) pending, we need it next
+                    // Otherwise, move to next batch
+                    let split_key = (curr_batch_idx, rows_per_task);
+                    if pending_results.contains_key(&split_key) {
+                        // Split batch exists, expect it next
+                        next_write_idx = (curr_batch_idx, rows_per_task);
+                    } else {
+                        // No split batch, move to next batch
+                        next_write_idx = (curr_batch_idx + 1, 0);
+                    }
+                } else {
+                    // We just wrote the second part of a split batch (start_row > 0)
+                    // Move to next batch
+                    next_write_idx = (curr_batch_idx + 1, 0);
+                }
+            }
+
+            if total_processed > 0 && total_written % 10000 == 0 {
+                eprintln!("进度: {} 描述符已生成并写入", total_written);
+            }
+        }
+
+        eprintln!("Writer loop ended. total_processed={}, total_written={}", total_processed, total_written);
+
+        ////////////////////////////////////////////////////////////////////////////////
+        // Finalize writer
+        ////////////////////////////////////////////////////////////////////////////////
+        writer.close()
+            .map_err(|e| format!("Failed to close writer: {}", e))?;
+
+        let desc_count = *descriptor_count.lock().unwrap();
+
+        eprintln!("描述符生成完成！");
+        eprintln!("  生成描述符数: {}", desc_count);
+
+        Ok(WriterResult {
+            descriptor_count: desc_count,
         })
     }
 }
@@ -696,12 +1108,59 @@ fn py_read_peel_subshells(header_path: String) -> PyResult<Vec<String>> {
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(e))
 }
 
+/// Python-exposed function to generate descriptors from parquet file (parallel version)
+#[cfg(feature = "python")]
+#[pyfunction]
+#[pyo3(signature = (
+    input_parquet,
+    output_parquet,
+    peel_subshells,
+    num_workers=None,
+    rows_per_task=None
+))]
+fn py_generate_descriptors_from_parquet_parallel(
+    py: Python,
+    input_parquet: String,
+    output_parquet: String,
+    peel_subshells: Vec<String>,
+    num_workers: Option<usize>,
+    rows_per_task: Option<usize>,
+) -> PyResult<pyo3::Py<pyo3::PyAny>> {
+    use std::path::Path;
+    use pyo3::types::PyDict;
+
+    let input_path = Path::new(&input_parquet).to_path_buf();
+    let output_path = Path::new(&output_parquet).to_path_buf();
+
+    // Release the GIL during the long-running operation
+    let stats = py.detach(
+        || parquet_batch::generate_descriptors_from_parquet_parallel(
+            &input_path,
+            &output_path,
+            peel_subshells,
+            num_workers,
+            rows_per_task,
+        )
+    ).map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+
+    let dict = PyDict::new(py);
+    dict.set_item("success", true)?;
+    dict.set_item("input_file", stats.input_file)?;
+    dict.set_item("output_file", stats.output_file)?;
+    dict.set_item("csf_count", stats.csf_count)?;
+    dict.set_item("descriptor_count", stats.descriptor_count)?;
+    dict.set_item("orbital_count", stats.orbital_count)?;
+    dict.set_item("descriptor_size", stats.descriptor_size)?;
+    Ok(dict.into())
+}
+
 /// Register the Python module functions and classes
 #[cfg(feature = "python")]
 pub fn register_descriptor_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(py_j_to_double_j, module)?)?;
     module.add_class::<PyCSFDescriptorGenerator>()?;
     module.add_function(wrap_pyfunction!(py_generate_descriptors_from_parquet, module)?)?;
+    module.add_function(wrap_pyfunction!(py_generate_descriptors_from_parquet_parallel, module)?)?;
     module.add_function(wrap_pyfunction!(py_read_peel_subshells, module)?)?;
     Ok(())
 }
