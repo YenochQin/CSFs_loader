@@ -18,6 +18,8 @@ __pycache__/
 uv.lock
 .env/
 .python-version
+.mypy_cache
+.ruff_cache
 
 # IDE 文件
 .vscode/
